@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>800</width>
-    <height>600</height>
+    <width>565</width>
+    <height>412</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -278,7 +278,7 @@
          </property>
          <property name="minimumSize">
           <size>
-           <width>50</width>
+           <width>30</width>
            <height>0</height>
           </size>
          </property>
@@ -321,7 +321,7 @@
          </property>
          <property name="minimumSize">
           <size>
-           <width>50</width>
+           <width>30</width>
            <height>0</height>
           </size>
          </property>
@@ -391,29 +391,7 @@
          </property>
          <property name="minimumSize">
           <size>
-           <width>50</width>
-           <height>0</height>
-          </size>
-         </property>
-         <property name="maximumSize">
-          <size>
-           <width>16777215</width>
-           <height>16777215</height>
-          </size>
-         </property>
-        </widget>
-       </item>
-       <item>
-        <widget class="QComboBox" name="comboBox_sync_status">
-         <property name="sizePolicy">
-          <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
-           <horstretch>0</horstretch>
-           <verstretch>0</verstretch>
-          </sizepolicy>
-         </property>
-         <property name="minimumSize">
-          <size>
-           <width>50</width>
+           <width>30</width>
            <height>0</height>
           </size>
          </property>
@@ -577,7 +555,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>800</width>
+     <width>565</width>
      <height>19</height>
     </rect>
    </property>
