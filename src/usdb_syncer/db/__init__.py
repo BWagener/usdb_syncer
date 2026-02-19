@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # https://www.sqlite.org/limits.html
 _SQL_VARIABLES_LIMIT = 32766
@@ -67,8 +67,7 @@ class _DbState:
         cls._local.connection = sqlite3.connect(
             db_path, check_same_thread=False, isolation_level=None, timeout=60
         )
-        thread = threading.current_thread().name
-        logger.debug(f"Connected to database at '{db_path}' on thread {thread}.")
+        logger.debug(f"Connected to database at '{db_path}'.")
         if cls.trace_sql:
             cls._local.connection.set_trace_callback(logger.debug)
         _validate_schema(cls._local.connection)
@@ -84,8 +83,7 @@ class _DbState:
         if _DbState._local.connection is not None:
             _DbState._local.connection.close()
             _DbState._local.connection = None
-            thread = threading.current_thread().name
-            logger.debug(f"Closed database connection on thread {thread}.")
+            logger.debug("Closed database connection.")
 
 
 @contextlib.contextmanager
@@ -114,6 +112,8 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
             raise errors.UnknownSchemaError
         version = row[0]
     for ver in range(version + 1, SCHEMA_VERSION + 1):
+        if ver == 10:
+            _migrate_to_version_10()
         connection.executescript(Sql.migration_text(ver))
         logger.debug(f"Database migrated to version {ver}.")
     if version < SCHEMA_VERSION:
@@ -211,8 +211,26 @@ class DownloadStatus(enum.IntEnum):
                 assert_never(unreachable)
 
 
-class SongOrder(enum.Enum):
-    """Attributes songs can be sorted by."""
+class SongOrderBase:
+    """Base class for native and custom song orders."""
+
+    def sql(self) -> str | None:
+        raise NotImplementedError
+
+    @staticmethod
+    def from_json(value: Any) -> SongOrderBase:
+        if isinstance(value, int):
+            return SongOrder(value)
+        if isinstance(value, str):
+            return CustomSongOrder(value)
+        raise TypeError
+
+    def parameter(self) -> str | None:
+        return None
+
+
+class SongOrder(SongOrderBase, enum.Enum):
+    """Native song orders."""
 
     NONE = 0
     SAMPLE_URL = enum.auto()
@@ -315,10 +333,32 @@ class SongOrder(enum.Enum):
 
 
 @attrs.define
+class CustomSongOrder(SongOrderBase):
+    """Custom song orders."""
+
+    custom_data_key: str
+
+    def sql(self) -> str:
+        return (
+            "CASE custom_meta_data.key WHEN ? THEN custom_meta_data.value "
+            "ELSE char(0x10FFFF) END"
+        )
+
+    def __eq__(self, value: Any) -> bool:
+        return (
+            isinstance(value, CustomSongOrder)
+            and value.custom_data_key == self.custom_data_key
+        )
+
+    def parameter(self) -> str | None:
+        return self.custom_data_key
+
+
+@attrs.define
 class SearchBuilder:
     """Helper for building a where clause to find songs."""
 
-    order: SongOrder = SongOrder.NONE
+    order: SongOrderBase = SongOrder.NONE
     descending: bool = False
     text: str = ""
     artists: list[str] = attrs.field(factory=list)
@@ -407,6 +447,8 @@ class SearchBuilder:
                 yield max_views
         if self.golden_notes is not None:
             yield self.golden_notes
+        if param := self.order.parameter():
+            yield param
 
     def statement(self) -> str:
         select_from = Sql.SELECT_SONG_ID.text()
@@ -414,15 +456,12 @@ class SearchBuilder:
         order_by = self._order_by_clause()
         return f"{select_from}{where}{order_by}"
 
-    def to_json(self) -> str:
-        return json.dumps(self, cls=_SearchEncoder)
-
     @classmethod
     def from_json(cls, json_str: str) -> SearchBuilder | None:
         fields = attrs.fields(cls)
         try:
             dct = json.loads(json_str)
-            dct[fields.order.name] = SongOrder(dct[fields.order.name])
+            dct[fields.order.name] = SongOrderBase.from_json(dct[fields.order.name])
             dct[fields.statuses.name] = [
                 DownloadStatus(s) for s in dct[fields.statuses.name]
             ]
@@ -439,116 +478,23 @@ class SearchBuilder:
         return None
 
 
-class _SearchEncoder(json.JSONEncoder):
-    """Custom encoder for a search."""
+def _migrate_to_version_10() -> None:
+    from usdb_syncer import settings
 
-    def default(self, o: Any) -> Any:
-        if isinstance(o, SearchBuilder):
-            return attrs.asdict(o, recurse=False)
-        if isinstance(o, enum.Enum):
-            return o.value
-        return super().default(o)
-
-
-@attrs.define
-class SavedSearch:
-    """A search saved to the database by the user."""
-
-    name: str
-    search: SearchBuilder
-    is_default: bool = False
-    subscribed: bool = False
-
-    def insert(self) -> None:
-        conn = _DbState.connection()
-        name = conn.execute(
-            Sql.SELECT_UNIQUE_SEARCH_NAME.text(),
-            {"new_name": self.name, "old_name": ""},
-        ).fetchone()[0]
-        conn.execute(
-            "INSERT INTO saved_search (name, search, is_default, subscribed)"
-            " VALUES (?, ?, ?, ?)",
-            (name, self.search.to_json(), self.is_default, self.subscribed),
-        )
-        self.name = name
-
-    def delete(self) -> None:
-        _DbState.connection().execute(
-            "DELETE FROM saved_search WHERE name = ?", (self.name,)
-        )
-
-    @classmethod
-    def get(cls, name: str) -> SavedSearch | None:
-        stmt = (
-            "SELECT name, search, is_default, subscribed FROM saved_search"
-            " WHERE name = ?"
-        )
-        row = _DbState.connection().execute(stmt, (name,)).fetchone()
-        if row and (search := cls._validate_saved_search_row(*row)):
-            return search
-        return None
-
-    @classmethod
-    def get_default(cls) -> SavedSearch | None:
-        stmt = (
-            "SELECT name, search, is_default, subscribed FROM saved_search"
-            " WHERE is_default = true"
-        )
-        row = _DbState.connection().execute(stmt).fetchone()
-        if row and (search := cls._validate_saved_search_row(*row)):
-            return search
-        return None
-
-    def update(self, new_name: str | None = None) -> None:
-        conn = _DbState.connection()
-        name = self.name
-        if new_name:
-            name = conn.execute(
-                Sql.SELECT_UNIQUE_SEARCH_NAME.text(),
-                {"new_name": new_name, "old_name": self.name},
-            ).fetchone()[0]
-        conn.execute(
-            "UPDATE saved_search SET name = ?, search = ?, is_default = ?,"
-            " subscribed = ? WHERE name = ?",
-            (name, self.search.to_json(), self.is_default, self.subscribed, self.name),
-        )
-        self.name = name
-
-    @classmethod
-    def load_saved_searches(
-        cls, subscribed_only: bool = False
-    ) -> Iterable[SavedSearch]:
-        stmt = (
-            "SELECT name, search, is_default, subscribed FROM saved_search"
-            f"{' WHERE subscribed' if subscribed_only else ''} ORDER BY name"
-        )
-        return (
-            search
-            for row in _DbState.connection().execute(stmt).fetchall()
-            if (search := cls._validate_saved_search_row(*row))
-        )
-
-    @classmethod
-    def _validate_saved_search_row(
-        cls, name: str, json_str: str, is_default: int, subscribed: int
-    ) -> SavedSearch | None:
-        if search := SearchBuilder.from_json(json_str):
-            return cls(name, search, bool(is_default), bool(subscribed))
-        _DbState.connection().execute(
-            "DELETE FROM saved_search WHERE name = ?", (name,)
-        )
-        logger.warning(f"Dropped invalid saved search '{name}'.")
-        return None
-
-    @classmethod
-    def get_subscribed_song_ids(cls) -> Iterable[SongId]:
-        if not (searches := list(cls.load_saved_searches(subscribed_only=True))):
-            return []
-        for search in searches:
-            search.search.order = SongOrder.NONE
-        stmt = "\nUNION\n".join(s.search.statement() for s in searches)
-        params = tuple(p for s in searches for p in s.search.parameters())
-        return (SongId(r[0]) for r in _DbState.connection().execute(stmt, params))
+    stmt = "SELECT name, search, subscribed FROM saved_search"
+    searches = [
+        settings.SavedSearch(row[0], search, bool(row[2]))
+        for row in _DbState.connection().execute(stmt).fetchall()
+        if (search := SearchBuilder.from_json(row[1]))
+    ]
+    settings.set_saved_searches(searches)
+    default = (
+        _DbState.connection()
+        .execute("SELECT name FROM saved_search WHERE is_default = True")
+        .fetchone()
+    )
+    if default:
+        settings.set_default_saved_search(default[0])
 
 
 def _in_values_clause(attribute: str, values: list) -> str:

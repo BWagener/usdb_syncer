@@ -14,7 +14,8 @@ from PySide6.QtCore import (
     QTimer,
 )
 
-from usdb_syncer import db
+from usdb_syncer import db, settings
+from usdb_syncer.gui import events as gui_events
 from usdb_syncer.gui.fonts import get_rating_font
 from usdb_syncer.gui.search_tree.item import (
     Filter,
@@ -35,7 +36,9 @@ class TreeModel(QAbstractItemModel):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.root = TreeItem()
+        self._theme = settings.get_theme()
         self.root.set_children(TreeItem(data=f, parent=self.root) for f in Filter)
+        gui_events.ThemeChanged.subscribe(self._on_theme_changed)
 
     def item_for_index(self, idx: QIndex) -> TreeItem | None:
         if idx.isValid():
@@ -48,6 +51,9 @@ class TreeModel(QAbstractItemModel):
     def emit_item_changed(self, item: TreeItem) -> None:
         idx = self.index_for_item(item)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.CheckStateRole])
+
+    def _on_theme_changed(self, event: gui_events.ThemeChanged) -> None:
+        self._theme = event.theme.KEY
 
     # change data
 
@@ -64,8 +70,7 @@ class TreeModel(QAbstractItemModel):
         item.checked = checked
 
     def insert_saved_search(self, search: SavedSearch) -> QModelIndex:
-        with db.transaction():
-            search.insert()
+        search.inner.insert()
         parent = self.root.children[0]
         parent_idx = self.index_for_item(parent)
         item = TreeItem(data=search, parent=parent)
@@ -79,8 +84,7 @@ class TreeModel(QAbstractItemModel):
         if not item or not isinstance(item.data, SavedSearch) or not item.parent:
             return
         self.beginRemoveRows(index.parent(), index.row(), index.row())
-        with db.transaction():
-            item.data.delete()
+        item.data.inner.remove()
         item.parent.remove_child(item)
         self.endRemoveRows()
 
@@ -135,7 +139,7 @@ class TreeModel(QAbstractItemModel):
         if role == Qt.ItemDataRole.CheckStateRole:
             return item.checked
         if role == Qt.ItemDataRole.DecorationRole:
-            return item.data.decoration()
+            return item.data.decoration(self._theme)
         if role == Qt.ItemDataRole.FontRole and isinstance(item.data, RatingVariant):
             return get_rating_font()
         return None
@@ -152,10 +156,10 @@ class TreeModel(QAbstractItemModel):
             and isinstance(value, str)
             and (item := self.item_for_index(index))
             and isinstance(item.data, SavedSearch)
-            and item.data.name != value
+            and item.data.inner.name != value
         ):
             return False
-        item.data.update(new_name=value)
+        item.data.inner.update(new_name=value)
         return True
 
 

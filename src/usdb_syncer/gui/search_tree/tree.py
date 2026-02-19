@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QModelIndex, Qt
 
-from usdb_syncer import db
+from usdb_syncer import db, settings
 from usdb_syncer.gui import events
 from usdb_syncer.gui.gui_utils import keyboard_modifiers
 
-from .item import Filter, SavedSearch
+from .item import CustomDataKeyMatch, Filter, SavedSearch
 from .model import TreeModel, TreeProxyModel
 
 if TYPE_CHECKING:
@@ -53,6 +53,9 @@ class FilterTree:
         self.mw.action_set_saved_search_subscribed.triggered.connect(
             self._set_search_subscribed
         )
+        self.mw.action_set_custom_meta_data_column.triggered.connect(
+            self._set_custom_meta_data_column
+        )
 
     def populate(self) -> None:
         self._model.populate()
@@ -72,7 +75,7 @@ class FilterTree:
         ):
             return
         if isinstance(item.data, SavedSearch):
-            events.SavedSearchRestored(item.data.search).post()
+            events.SavedSearchRestored(item.data.inner.search).post()
         else:
             for changed in item.toggle_checked(keyboard_modifiers().ctrl):
                 self._model.emit_item_changed(changed)
@@ -97,13 +100,20 @@ class FilterTree:
             actions = [self.mw.action_add_saved_search]
         elif item and isinstance(item.data, SavedSearch):
             self.mw.action_set_saved_search_default.setChecked(item.data.is_default)
-            self.mw.action_set_saved_search_subscribed.setChecked(item.data.subscribed)
+            self.mw.action_set_saved_search_subscribed.setChecked(
+                item.data.inner.subscribed
+            )
             actions = [
                 self.mw.action_update_saved_search,
                 self.mw.action_delete_saved_search,
                 self.mw.action_set_saved_search_default,
                 self.mw.action_set_saved_search_subscribed,
             ]
+        elif item and isinstance(item.data, CustomDataKeyMatch):
+            self.mw.action_set_custom_meta_data_column.setChecked(
+                item.data.key in settings.get_custom_meta_data_columns()
+            )
+            actions = [self.mw.action_set_custom_meta_data_column]
         else:
             return
         menu = QtWidgets.QMenu()
@@ -125,13 +135,14 @@ class FilterTree:
 
     def _update_saved_search(self) -> None:
         if search := self._get_current_saved_search():
-            search.search = copy.deepcopy(self._search)
-            with db.transaction():
-                search.update()
+            search.inner.search = copy.deepcopy(self._search)
+            search.inner.update()
 
     def _add_saved_search(self) -> None:
         index = self._proxy_model.mapFromSource(
-            self._model.insert_saved_search(SavedSearch("My search", self._search))
+            self._model.insert_saved_search(
+                SavedSearch(settings.SavedSearch("My search", self._search))
+            )
         )
         self.view.setCurrentIndex(index)
         self.view.edit(index)
@@ -143,14 +154,12 @@ class FilterTree:
                     if isinstance(item.data, SavedSearch) and item.data.is_default:
                         item.data.is_default = False
             search.is_default = default
-            with db.transaction():
-                search.update()
+            settings.set_default_saved_search(search.inner.name if default else "")
 
     def _set_search_subscribed(self, subscribe: bool) -> None:
         if search := self._get_current_saved_search():
-            search.subscribed = subscribe
-            with db.transaction():
-                search.update()
+            search.inner.subscribed = subscribe
+            search.inner.update()
 
     def _on_search_order_changed(self, event: events.SearchOrderChanged) -> None:
         self._search.descending = event.descending
@@ -158,3 +167,19 @@ class FilterTree:
 
     def _on_text_filter_changed(self, event: events.TextFilterChanged) -> None:
         self._search.text = event.search
+
+    def _set_custom_meta_data_column(self, enabled: bool) -> None:
+        item = self._model.item_for_index(
+            self._proxy_model.mapToSource(self.view.currentIndex())
+        )
+        if not item or not isinstance(item.data, CustomDataKeyMatch):
+            return
+        cols = settings.get_custom_meta_data_columns()
+        if enabled and item.data.key not in cols:
+            cols.append(item.data.key)
+        elif not enabled and item.data.key in cols:
+            cols.remove(item.data.key)
+        else:
+            return
+        settings.set_custom_meta_data_columns(cols)
+        events.CustomColumnToggled(item.data.key, enabled).post()

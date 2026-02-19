@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import cProfile
+import contextlib
+import io
 import logging
 import shutil
 import subprocess
@@ -16,10 +17,20 @@ from typing import TYPE_CHECKING, Any
 
 import attrs
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, qInstallMessageHandler
 
 import usdb_syncer
-from usdb_syncer import addons, data, db, errors, logger, settings, song_routines, utils
+from usdb_syncer import (
+    addons,
+    constants,
+    data,
+    db,
+    errors,
+    logger,
+    settings,
+    song_routines,
+    utils,
+)
 from usdb_syncer import sync_meta as sync_meta
 from usdb_syncer import usdb_song as usdb_song
 from usdb_syncer.gui import events, hooks, theme
@@ -48,6 +59,8 @@ NOGIL_ERROR_MESSAGE = (
 class CliArgs:
     """Command line arguments."""
 
+    log_level: str = "INFO"
+
     reset_settings: bool = False
     subcommand: str = ""
 
@@ -56,7 +69,7 @@ class CliArgs:
 
     # Development
     profile: bool = False
-    skip_pyside: bool = not utils.IS_SOURCE
+    skip_pyside: bool = not constants.IS_SOURCE
     trace_sql: bool = False
     healthcheck: bool = False
 
@@ -73,6 +86,12 @@ class CliArgs:
         parser = ArgumentParser(description="USDB Syncer")
         parser.add_argument(
             "--version", action="version", version=usdb_syncer.__version__
+        )
+        parser.add_argument(
+            "--log-level",
+            type=str.upper,
+            choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+            help="Set the log level for stderr logging. Default is info.",
         )
         parser.add_argument(
             "--reset-settings",
@@ -97,7 +116,7 @@ class CliArgs:
         dev_options.add_argument(
             "--healthcheck", action="store_true", help="Run healthcheck and exit."
         )
-        if utils.IS_SOURCE:
+        if constants.IS_SOURCE:
             dev_options.add_argument(
                 "--skip-pyside",
                 action="store_true",
@@ -131,13 +150,12 @@ class CliArgs:
 
     def apply(self) -> None:
         if self.healthcheck:
-            sys.exit(_run_heathcheck())
+            sys.exit(_run_healthcheck())
         if self.reset_settings:
             settings.reset()
-            print("Settings reset to default.")
         if self.songpath:
             settings.set_song_dir(self.songpath.resolve(), temp=True)
-        if utils.IS_SOURCE and not self.skip_pyside:
+        if constants.IS_SOURCE and not self.skip_pyside:
             import tools.generate_pyside_files  # pylint: disable=import-outside-toplevel
 
             tools.generate_pyside_files.main()
@@ -145,14 +163,16 @@ class CliArgs:
 
 
 def main() -> None:
-    if hasattr(sys, "_is_gil_enabled") and sys._is_gil_enabled() is False:
+    sys.excepthook = _excepthook
+    if not getattr(sys, "_is_gil_enabled", lambda: True)():
         print(NOGIL_ERROR_MESSAGE)
         sys.exit(1)
-    sys.excepthook = _excepthook
+    qInstallMessageHandler(handle_qt_log)
     args = CliArgs.parse()
     args.apply()
     addons.load_all()
     utils.AppPaths.make_dirs()
+    configure_logging(stderr_level=args.log_level)
     app = _init_app()
     app.setAttribute(Qt.ApplicationAttribute.AA_DontShowIconsInMenus, False)
 
@@ -173,23 +193,23 @@ def main() -> None:
                 run_main()
 
 
-def configure_logging(mw: MainWindow | None = None) -> None:
+def configure_logging(stderr_level: logger.LOGLEVEL = logging.DEBUG) -> None:
     handlers: list[logging.Handler] = [
         logging.FileHandler(utils.AppPaths.log, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
+        logger.StderrHandler(level=stderr_level),
     ]
-    if mw:
-        handlers.append(_TextEditLogger(mw))
-    logger.configure_logging(*handlers)
+    logger.configure_logging(*handlers, formatter=logger.DEBUG_FORMATTER)
 
 
 def _run_main() -> None:
     from usdb_syncer.gui.mw import MainWindow
 
     mw = MainWindow()
-    configure_logging(mw)
+    mw_logger = _TextEditLogger(mw)
+    mw_logger.setFormatter(logger.GUI_FORMATTER)
+    logger.add_root_handler(mw_logger)
     mw.label_update_hint.setVisible(False)
-    if not utils.IS_SOURCE:
+    if not constants.IS_SOURCE:
         if version := utils.newer_version_available():
             mw.label_update_hint.setText(
                 mw.label_update_hint.text().replace("VERSION", version)
@@ -202,13 +222,12 @@ def _run_main() -> None:
         _load_main_window(mw)
     except errors.UnknownSchemaError:
         QtWidgets.QMessageBox.critical(mw, "Version conflict", SCHEMA_ERROR_MESSAGE)
-        return
+        sys.exit(1)
     _maybe_copy_licenses()
     hooks.MainWindowDidLoad.call(mw)
 
 
 def _run_preview(txt: Path) -> bool:
-    configure_logging()
     from usdb_syncer.gui.previewer import Previewer
 
     theme.Theme.from_settings().apply()
@@ -218,7 +237,6 @@ def _run_preview(txt: Path) -> bool:
 def _run_webserver(
     host: str | None = None, port: int | None = None, title: str | None = None
 ) -> None:
-    configure_logging()
     webserver.start(host=host, port=port, title=title)
     logger.logger.info("Webserver is running in headless mode. Press Ctrl+C to stop.")
     try:
@@ -236,7 +254,9 @@ def _excepthook(
 
 
 def _with_profile(func: Callable[[], None]) -> None:
-    print("Running with profiling enabled.")
+    import cProfile
+
+    logger.logger.debug("Running with profiling enabled.")
     profiler = cProfile.Profile()
     profiler.enable()
     func()
@@ -256,7 +276,7 @@ def _load_main_window(mw: MainWindow) -> None:
         db.delete_session_data()
     song_routines.load_available_songs_and_sync_meta(folder, False)
     mw.tree.populate()
-    if default_search := db.SavedSearch.get_default():
+    if default_search := settings.SavedSearch.get_default():
         events.SavedSearchRestored(default_search.search).post()
         logger.logger.info(f"Applied default search '{default_search.name}'.")
     mw.table.search_songs()
@@ -297,7 +317,7 @@ def _init_app() -> QtWidgets.QApplication:
 
 
 def _maybe_copy_licenses() -> None:
-    if not utils.IS_BUNDLE:
+    if not constants.IS_BUNDLE:
         return
 
     license_hash = (
@@ -324,30 +344,62 @@ def _maybe_copy_licenses() -> None:
     )
 
 
-def _run_heathcheck() -> int:
+class StderrHandler(io.StringIO):
+    """Handler for stderr that also prints to the original stderr."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._original_stderr = sys.stderr
+
+    def write(self, s: str) -> int:
+        self._original_stderr.write(s)
+        return super().write(s)
+
+    def flush(self) -> None:
+        self._original_stderr.flush()
+        super().flush()
+
+
+def _run_healthcheck() -> int:
     """Run a healthcheck and return exit code."""
+    handler = StderrHandler()
     try:
-        # gui modules check
-        from usdb_syncer.gui.mw import MainWindow  # noqa: F401
+        with contextlib.redirect_stderr(handler):
+            # import sounddevice properly
+            from usdb_syncer.gui import previewer  # noqa: F401
 
-        # database check
-        db.connect(":memory:")
+            # gui modules check
+            from usdb_syncer.gui.mw import MainWindow  # noqa: F401
 
-        # resources check
-        from usdb_syncer.gui.resources.text import NOTICE
+            # database check
+            db.connect(":memory:")
 
-        NOTICE.read_text()
+            # resources check
+            from usdb_syncer.gui.resources.text import NOTICE
 
-        # sounddevice check
-        with utils.LinuxEnvCleaner():
-            import sounddevice  # noqa: F401
+            NOTICE.read_text(encoding="utf-8")
+
+            # sounddevice check
+            import sounddevice
+
+            sounddevice.query_devices()
 
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         print(f"USDB Syncer healthcheck: failed: {e}")
         return 1
+    handler.seek(0)
+    for line in handler:
+        if "[ERROR]" in line or "[WARNING]" in line or "[CRITICAL]" in line:
+            print(f"USDB Syncer healthcheck: failed with error log: {line}")
+            return 2
     print("USDB Syncer healthcheck: No problems found.")
     return 0
+
+
+def handle_qt_log(mode: int, _: Any, message: str) -> None:
+    """Log Qt messages to the main logger."""
+    logger.logger.debug(f"Qt log message with mode {mode}: {message}")
 
 
 class _LogSignal(QtCore.QObject):

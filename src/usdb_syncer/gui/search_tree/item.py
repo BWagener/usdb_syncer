@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Generic, TypeVar, assert_never
 import attrs
 from PySide6.QtCore import Qt
 
-from usdb_syncer import db
+from usdb_syncer import db, settings
 from usdb_syncer.constants import BLACK_STAR, HALF_BLACK_STAR
 from usdb_syncer.custom_data import CustomData
 from usdb_syncer.gui.icons import Icon
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 class TreeItemData:
     """Interface for objects to be rendered as a tree node."""
 
-    def decoration(self) -> QIcon | None:
+    def decoration(self, theme: settings.Theme) -> QIcon | None:
         raise NotImplementedError
 
     def is_checkable(self, has_checked_children: bool) -> bool:
@@ -51,7 +51,7 @@ class TreeItemData:
 class RootItemData(TreeItemData):
     """Implementation of the tree root."""
 
-    def decoration(self) -> QIcon | None:
+    def decoration(self, theme: settings.Theme) -> QIcon | None:  # noqa: ARG002
         return None
 
     def is_checkable(self, has_checked_children: bool) -> bool:  # noqa: ARG002
@@ -287,7 +287,7 @@ class Filter(TreeItemData, enum.Enum):
             case _ as unreachable:
                 assert_never(unreachable)
 
-    def decoration(self) -> QIcon:  # noqa: C901
+    def decoration(self, theme: settings.Theme) -> QIcon:  # noqa: C901
         match self:
             case Filter.SAVED:
                 icon = Icon.SAVED_SEARCH
@@ -315,7 +315,7 @@ class Filter(TreeItemData, enum.Enum):
                 icon = Icon.CUSTOM_DATA
             case _ as unreachable:
                 assert_never(unreachable)
-        return icon.icon()
+        return icon.icon(theme)
 
     def is_checkable(self, has_checked_children: bool) -> bool:
         return self != Filter.SAVED and has_checked_children
@@ -339,7 +339,7 @@ class Filter(TreeItemData, enum.Enum):
 class NodeItemData(TreeItemData):
     """Base implementation for a child of a filter item."""
 
-    def decoration(self) -> QIcon | None:
+    def decoration(self, theme: settings.Theme) -> QIcon | None:  # noqa: ARG002
         return None
 
     def is_checkable(self, has_checked_children: bool) -> bool:  # noqa: ARG002
@@ -530,20 +530,25 @@ class ViewsVariant(NodeItemData, enum.Enum):
 
 
 @attrs.define
-class SavedSearch(NodeItemData, db.SavedSearch):
+class SavedSearch(NodeItemData):
     """A search saved by the user."""
+
+    inner: settings.SavedSearch
+    is_default: bool = False
 
     @classmethod
     def load_all(cls) -> Iterable[SavedSearch]:
-        with db.transaction():
-            searches = db.SavedSearch.load_saved_searches()
-        return (cls(s.name, s.search, s.is_default, s.subscribed) for s in searches)
+        default = settings.get_default_saved_search()
+        return (
+            cls(s, is_default=s.name == default)
+            for s in sorted(settings.get_saved_searches(), key=lambda s: s.name)
+        )
 
     def build_search(self, search: db.SearchBuilder) -> None:
         pass
 
     def __str__(self) -> str:
-        return self.name
+        return self.inner.name
 
     def is_in_search(self, search: db.SearchBuilder) -> bool:  # noqa: ARG002
         return False

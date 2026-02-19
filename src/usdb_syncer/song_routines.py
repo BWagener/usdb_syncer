@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from importlib import resources
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -76,8 +77,7 @@ def load_available_songs(
     except errors.UsdbLoginError:
         logger.debug("Skipping fetching new songs as there is no login.")
     except requests.exceptions.ConnectionError:
-        logger.debug("", exc_info=True)
-        logger.error("Failed to fetch new songs; check network connection.")
+        logger.exception("Failed to fetch new songs; check network connection.")
     else:
         result.synced_with_usdb = True
         if songs:
@@ -90,10 +90,20 @@ def load_available_songs(
     return result
 
 
+def _get_default_search_song_ids() -> set[SongId]:
+    return set(
+        *chain(
+            db.search_usdb_songs(s.search)
+            for s in settings.get_saved_searches()
+            if s.subscribed
+        )
+    )
+
+
 def initialize_auto_downloads(updates: set[SongId]) -> None:
     if not utils.ffmpeg_is_available():
         return
-    download_ids = set(db.SavedSearch.get_subscribed_song_ids()).intersection(updates)
+    download_ids = _get_default_search_song_ids().intersection(updates)
     if settings.get_auto_update():
         search = db.SearchBuilder(statuses=[db.DownloadStatus.OUTDATED])
         download_ids.update(db.search_usdb_songs(search))

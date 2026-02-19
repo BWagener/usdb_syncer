@@ -1,10 +1,9 @@
 """usdb_syncer's GUI."""
 
-import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QShowEvent
 from PySide6.QtWidgets import QFileDialog, QMainWindow
 
 from usdb_syncer import SongId, db, events, settings, song_routines, usdb_id_file, utils
@@ -40,7 +39,7 @@ from usdb_syncer.song_loader import DownloadManager
 from usdb_syncer.sync_meta import SyncMeta
 from usdb_syncer.usdb_scraper import SessionManager, UserRole, post_song_rating
 from usdb_syncer.usdb_song import UsdbSong
-from usdb_syncer.utils import AppPaths, LinuxEnvCleaner, open_path_or_file
+from usdb_syncer.utils import AppPaths, open_path_or_file
 from usdb_syncer.webserver import webserver
 
 
@@ -72,8 +71,14 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         gui_events.CurrentSongChanged.subscribe(self._on_current_song_changed)
         self._setup_buttons()
         self.cover = cover_widget.ScaledCoverLabel(self.dock_cover)
-        self._restore_state()
         self._current_song_id: int | None = None
+        self._state_restored = False
+
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        if not self._state_restored:
+            self._restore_state()
+            self._state_restored = True
 
     def _focus_search(self) -> None:
         self.lineEdit_search.setFocus()
@@ -368,8 +373,7 @@ class MainWindow(Ui_MainWindow, QMainWindow):
     def _show_current_song_in_usdb(self) -> None:
         if song := self.table.current_song():
             logger.debug(f"Opening song page #{song.song_id} in webbrowser.")
-            with LinuxEnvCleaner():
-                webbrowser.open(f"{Usdb.DETAIL_URL}{song.song_id:d}")
+            utils.open_url_in_browser(f"{Usdb.DETAIL_URL}{song.song_id:d}")
         else:
             logger.info("No current song.")
 
@@ -455,18 +459,17 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             event.accept()
         else:
             logger.debug("Close event deferred, cleaning up ...")
+            events.Shutdown().post()
             run_with_progress("Shutting down ...", cleanup, on_done)
             event.ignore()
 
     def _restore_state(self) -> None:
         self.restoreGeometry(settings.get_geometry_main_window())
         self.restoreState(settings.get_state_main_window())
-        self.dock_log.restoreGeometry(settings.get_geometry_log_dock())
 
     def _save_state(self) -> None:
         settings.set_geometry_main_window(self.saveGeometry())
         settings.set_state_main_window(self.saveState())
-        settings.set_geometry_log_dock(self.dock_log.saveGeometry())
 
     def _on_theme_changed(self, event: gui_events.ThemeChanged) -> None:
         key = event.theme.KEY
